@@ -171,11 +171,11 @@ const MOVEM_REGS: [Register; 16] = [
 ];
 
 /// Instruction decode cache. Each opcode (16-bit) has a slot, index = opcode.
-type DecodeCache = Vec<Option<Instruction>>;
+type DecodeCache = Box<[Option<Instruction>; Word::MAX as usize + 1]>;
 
 /// Creates an empty instruction cache
 fn empty_decode_cache() -> DecodeCache {
-    vec![None; Word::MAX as usize + 1]
+    vec![None; Word::MAX as usize + 1].try_into().unwrap()
 }
 
 /// I-cache cache line size (68020/68030)
