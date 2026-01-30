@@ -3,6 +3,8 @@ use std::fmt::Display;
 use anyhow::Result;
 use proc_bitfield::bitfield;
 use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
+use serde_with::serde_as;
 
 use crate::bus::{Address, BusMember};
 use crate::debuggable::Debuggable;
@@ -10,6 +12,8 @@ use crate::mac::MacMonitor;
 use crate::renderer::{DisplayBuffer, Renderer};
 use crate::tickable::{Tickable, Ticks};
 use crate::types::{Field32, LatchingEvent, Word};
+
+const VRAM_SIZE: usize = 0x200000;
 
 bitfield! {
     /// Control register
@@ -63,6 +67,7 @@ pub enum Bpp {
 }
 
 /// Macintosh Display Card 1.2.341-0868
+#[serde_as]
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct Mdc12<TRenderer: Renderer> {
@@ -76,12 +81,15 @@ pub struct Mdc12<TRenderer: Renderer> {
     vblank_irq: bool,
     vblank_enable: bool,
     vblank_ticks: Ticks,
-    pub vram: Vec<u8>,
+    // vram must be Box'ed or else this struct will blow the stack.
+    #[serde_as(as = "Box<[_; VRAM_SIZE]>")]
+    pub vram: Box<[u8; VRAM_SIZE]>,
     toggle: bool,
     pub render: LatchingEvent,
     base: Field32,
     stride: Field32,
-    pub palette: Vec<u32>,
+    #[serde(with = "BigArray")]
+    pub palette: [u32; 256],
     palette_addr: Field32,
     palette_wr: Field32,
     palette_cnt: usize,
@@ -100,10 +108,10 @@ where
             ramdac_ctrl: RamdacCtrlReg(0),
             vblank_irq: false,
             vblank_enable: false,
-            vram: vec![0; 0x1FFFFF],
+            vram: vec![0; VRAM_SIZE].try_into().unwrap(),
             toggle: false,
             vblank_ticks: 0,
-            palette: vec![0; 256],
+            palette: [0; 256],
             palette_addr: Field32(0),
             palette_wr: Field32(0),
             render: LatchingEvent::default(),
