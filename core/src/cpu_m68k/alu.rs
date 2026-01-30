@@ -4,7 +4,7 @@ use super::{CpuM68kType, CpuSized};
 use crate::cpu_m68k::FpuM68kType;
 
 use crate::bus::{Address, Bus, IrqSource};
-use crate::types::{Byte, Long, Word};
+use crate::types::{Byte, Long, MyIntTraits, Word};
 
 impl<
         TBus,
@@ -18,22 +18,17 @@ where
 {
     /// Add (a + b = c)
     pub(super) fn alu_add<T: CpuSized>(a: T, b: T, f: RegisterSR) -> (T, u8) {
-        let a = a.expand();
-        let b = b.expand();
-        let result: Long = a.wrapping_add(b);
-
-        let msb: Long = T::msb().into();
-        let carry: Long = a ^ b ^ result;
-        let overflow: Long = (a ^ result) & (b ^ result);
+        let (result, carry) = a.overflowing_add(b);
+        let (_, overflow) = a.cast_signed().overflowing_add(b.cast_signed());
 
         let mut new_f = f;
-        new_f.set_c((carry ^ overflow) & msb != 0);
-        new_f.set_x((carry ^ overflow) & msb != 0);
-        new_f.set_v(overflow & msb != 0);
-        new_f.set_n(result & msb != 0);
-        new_f.set_z(T::chop(result) == T::zero());
+        new_f.set_c(carry);
+        new_f.set_x(carry);
+        new_f.set_v(overflow);
+        new_f.set_n(result & T::msb() != T::zero());
+        new_f.set_z(result == T::zero());
 
-        (T::chop(result), new_f.ccr())
+        (result, new_f.ccr())
     }
 
     /// Add (a + b + x = c)
@@ -61,22 +56,17 @@ where
 
     /// Subtract (a - b = c)
     pub(super) fn alu_sub<T: CpuSized>(a: T, b: T, f: RegisterSR) -> (T, u8) {
-        let a = a.expand();
-        let b = b.expand();
-        let result: Long = a.wrapping_sub(b);
-
-        let msb: Long = T::msb().into();
-        let carry: Long = a ^ b ^ result;
-        let overflow: Long = (a ^ result) & (b ^ a);
+        let (result, carry) = a.overflowing_sub(b);
+        let (_, overflow) = a.cast_signed().overflowing_sub(b.cast_signed());
 
         let mut new_f = f;
-        new_f.set_c((carry ^ overflow) & msb != 0);
-        new_f.set_x((carry ^ overflow) & msb != 0);
-        new_f.set_v(overflow & msb != 0);
-        new_f.set_n(result & msb != 0);
-        new_f.set_z(T::chop(result) == T::zero());
+        new_f.set_c(carry);
+        new_f.set_x(carry);
+        new_f.set_v(overflow);
+        new_f.set_n(result & T::msb() != T::zero());
+        new_f.set_z(result == T::zero());
 
-        (T::chop(result), new_f.ccr())
+        (result, new_f.ccr())
     }
 
     /// Subtract with extend (a - b - x = c)
@@ -182,97 +172,101 @@ where
     }
 
     /// Arithmetic right shift
-    pub(super) fn alu_asr<T: CpuSized>(mut value: T, count: usize, mut f: RegisterSR) -> (T, u8) {
-        let mut overflow = T::zero();
+    pub(super) fn alu_asr<T: CpuSized>(value: T, count: u8, mut f: RegisterSR) -> (T, u8) {
+        // Perform shift on a 64-bit value since count is guaranteed to be in 0..=63.
+        let value = value.expand_signed() as i64;
 
-        f.set_c(false);
+        let carry = if count == 0 {
+            false
+        } else {
+            (value >> (count - 1)) & 1 != 0
+        };
 
-        for _ in 0..count {
-            let old = value;
-            let msb = value & T::msb() != T::zero();
+        let value = T::chop((value >> count) as Long);
 
-            f.set_c(value & T::one() != T::zero());
-
-            value >>= T::one();
-            if msb {
-                value |= T::msb();
-            }
-            overflow |= old ^ value;
-        }
-
-        f.set_v(overflow & T::msb() != T::zero());
+        f.set_c(carry);
+        f.set_v(false);
         f.set_z(value == T::zero());
         f.set_n(value & T::msb() != T::zero());
         if count != 0 {
-            f.set_x(f.c());
+            f.set_x(carry);
         }
         (value, f.ccr())
     }
 
     /// Arithmetic left shift
-    pub(super) fn alu_asl<T: CpuSized>(mut value: T, count: usize, mut f: RegisterSR) -> (T, u8) {
-        let mut overflow = T::zero();
+    pub(super) fn alu_asl<T: CpuSized>(value: T, count: u8, mut f: RegisterSR) -> (T, u8) {
+        // Perform shift on a 64-bit value since count is guaranteed to be in 0..=63.
+        let zext_value = value.expand() as u64;
+        let sext_value = value.expand_signed() as i64;
 
-        f.set_c(false);
+        // Detect if the most significant bit changes at any time during the shift operation.
+        let initial_upper_and_sign = sext_value >> (T::BITS - 1);
+        let new_upper_and_sign = (sext_value << count) >> (T::BITS - 1);
+        let overflow = initial_upper_and_sign != new_upper_and_sign;
 
-        for _ in 0..count {
-            let old = value;
+        // Compute carry flag. Use the zero-extended value here to ensure C is correct if
+        // count == 0.
+        let value = zext_value << count;
+        let carry = value & (1u64 << T::BITS) != 0;
 
-            f.set_c(value & T::msb() != T::zero());
+        let value = T::chop(value as Long);
 
-            value <<= T::one();
-            overflow |= old ^ value;
-        }
-
-        f.set_v(overflow & T::msb() != T::zero());
+        f.set_c(carry);
+        f.set_v(overflow);
         f.set_z(value == T::zero());
         f.set_n(value & T::msb() != T::zero());
         if count != 0 {
-            f.set_x(f.c());
+            f.set_x(carry);
         }
         (value, f.ccr())
     }
 
     /// Logical left shift
-    pub(super) fn alu_lsl<T: CpuSized>(mut value: T, count: usize, mut f: RegisterSR) -> (T, u8) {
-        f.set_c(false);
+    pub(super) fn alu_lsl<T: CpuSized>(value: T, count: u8, mut f: RegisterSR) -> (T, u8) {
+        // Perform shift on a 64-bit value since count is guaranteed to be in 0..=63.
+        let value = value.expand() as u64;
+
+        let value = value << count;
+        let carry = value & (1u64 << T::BITS) != 0;
+
+        let value = T::chop(value as Long);
+
+        f.set_c(carry);
         f.set_v(false);
-
-        for _ in 0..count {
-            f.set_c(value & T::msb() != T::zero());
-
-            value <<= T::one();
-        }
-
         f.set_z(value == T::zero());
         f.set_n(value & T::msb() != T::zero());
         if count != 0 {
-            f.set_x(f.c());
+            f.set_x(carry);
         }
         (value, f.ccr())
     }
 
     /// Logical right shift
-    pub(super) fn alu_lsr<T: CpuSized>(mut value: T, count: usize, mut f: RegisterSR) -> (T, u8) {
-        f.set_c(false);
+    pub(super) fn alu_lsr<T: CpuSized>(value: T, count: u8, mut f: RegisterSR) -> (T, u8) {
+        // Perform shift on a 64-bit value since count is guaranteed to be in 0..=63.
+        let value = value.expand() as u64;
+
+        let carry = if count == 0 {
+            false
+        } else {
+            (value >> (count - 1)) & 1 != 0
+        };
+
+        let value = T::chop((value >> count) as Long);
+
+        f.set_c(carry);
         f.set_v(false);
-
-        for _ in 0..count {
-            f.set_c(value & T::one() != T::zero());
-
-            value >>= T::one();
-        }
-
         f.set_z(value == T::zero());
         f.set_n(value & T::msb() != T::zero());
         if count != 0 {
-            f.set_x(f.c());
+            f.set_x(carry);
         }
         (value, f.ccr())
     }
 
     /// Rotate left
-    pub(super) fn alu_rol<T: CpuSized>(mut value: T, count: usize, mut f: RegisterSR) -> (T, u8) {
+    pub(super) fn alu_rol<T: CpuSized>(mut value: T, count: u8, mut f: RegisterSR) -> (T, u8) {
         // For shift count 0, carry is cleared
         f.set_c(false);
 
@@ -292,7 +286,7 @@ where
     }
 
     /// Rotate right
-    pub(super) fn alu_ror<T: CpuSized>(mut value: T, count: usize, mut f: RegisterSR) -> (T, u8) {
+    pub(super) fn alu_ror<T: CpuSized>(mut value: T, count: u8, mut f: RegisterSR) -> (T, u8) {
         // For shift count 0, carry is cleared
         f.set_c(false);
 
@@ -312,7 +306,7 @@ where
     }
 
     /// Rotate left with extend
-    pub(super) fn alu_roxl<T: CpuSized>(mut value: T, count: usize, mut f: RegisterSR) -> (T, u8) {
+    pub(super) fn alu_roxl<T: CpuSized>(mut value: T, count: u8, mut f: RegisterSR) -> (T, u8) {
         for _ in 0..count {
             let x = f.x();
             f.set_x(value & T::msb() != T::zero());
@@ -331,7 +325,7 @@ where
     }
 
     /// Rotate right with extend
-    pub(super) fn alu_roxr<T: CpuSized>(mut value: T, count: usize, mut f: RegisterSR) -> (T, u8) {
+    pub(super) fn alu_roxr<T: CpuSized>(mut value: T, count: u8, mut f: RegisterSR) -> (T, u8) {
         for _ in 0..count {
             let x = f.x();
             f.set_x(value & T::one() != T::zero());
