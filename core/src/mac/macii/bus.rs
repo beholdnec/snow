@@ -86,6 +86,10 @@ pub struct MacIIBus<TRenderer: Renderer, const AMU: bool> {
     #[serde(skip, default = "Instant::now")]
     vblank_time: Instant,
 
+    vblank_cycles: Ticks,
+
+    asc_cycles: Ticks,
+
     /// Programmer's key pressed
     progkey_pressed: LatchingEvent,
 
@@ -209,6 +213,8 @@ where
             speed: EmulatorSpeed::Accurate,
             //last_audiosample: 0,
             vblank_time: Instant::now(),
+            vblank_cycles: 0,
+            asc_cycles: 0,
             //vpa_sync: false,
             progkey_pressed: LatchingEvent::default(),
 
@@ -723,8 +729,6 @@ where
     TRenderer: Renderer,
 {
     fn tick(&mut self, ticks: Ticks) -> Result<Ticks> {
-        // This is called from the CPU, at the CPU clock speed
-        assert_eq!(ticks, 1);
         self.cycles += ticks;
 
         if AMU {
@@ -743,7 +747,10 @@ where
         }
 
         // Legacy VBlank interrupt
-        if self.cycles.is_multiple_of(CLOCK_SPEED / 60) {
+        self.vblank_cycles += ticks;
+        while self.vblank_cycles >= CLOCK_SPEED / 60 {
+            self.vblank_cycles -= CLOCK_SPEED / 60;
+
             self.via1.ifr.set_vblank(true);
 
             if self.speed == EmulatorSpeed::Video {
@@ -758,15 +765,13 @@ where
                 }
             }
         }
-
         // Audio
         if self.asc.get_irq() {
             self.via2.ifr.set_asc(true);
         }
-        if self
-            .cycles
-            .is_multiple_of(CLOCK_SPEED / self.asc.sample_rate())
-        {
+        self.asc_cycles += ticks;
+        while self.asc_cycles >= CLOCK_SPEED / self.asc.sample_rate() {
+            self.asc_cycles -= CLOCK_SPEED / self.asc.sample_rate();
             self.asc.tick(self.speed == EmulatorSpeed::Accurate)?;
         }
 
@@ -789,7 +794,7 @@ where
         self.via2.ifr.set_scsi_drq(self.scsi.get_drq());
 
         self.swim.intdrive = self.via1.a_out.drivesel();
-        self.swim.tick(1)?;
+        self.swim.tick(ticks)?;
 
         Ok(1)
     }

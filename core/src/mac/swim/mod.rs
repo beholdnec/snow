@@ -99,6 +99,8 @@ pub struct Swim {
     cycles: Ticks,
     mode: SwimMode,
 
+    bitstream_cycles: Ticks,
+
     pub ca0: bool,
     pub ca1: bool,
     pub ca2: bool,
@@ -161,6 +163,8 @@ impl Swim {
             cycles: 0,
             // SWIM boots in IWM mode
             mode: Default::default(),
+
+            bitstream_cycles: 0,
 
             ca0: false,
             ca1: false,
@@ -306,8 +310,6 @@ impl BusMember<Address> for Swim {
 
 impl Tickable for Swim {
     fn tick(&mut self, ticks: Ticks) -> Result<Ticks> {
-        debug_assert_eq!(ticks, 1);
-
         // This is called at the Macintosh main clock speed (TICKS_PER_SECOND == 8 MHz)
         self.cycles += ticks;
         for drv in &mut self.drives {

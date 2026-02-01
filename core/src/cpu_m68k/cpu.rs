@@ -260,6 +260,9 @@ pub struct CpuM68k<
     /// Total cycle counter
     pub cycles: Ticks,
 
+    /// Cycle counter of last bus sync
+    pub bus_sync_cycles: Ticks,
+
     /// Current prefetch queue
     pub prefetch: VecDeque<u16>,
 
@@ -353,6 +356,7 @@ where
             bus,
             regs: RegisterFile::new(),
             cycles: 0,
+            bus_sync_cycles: 0,
             prefetch: VecDeque::with_capacity(3),
             step_ea_addr: None,
             step_exception: false,
@@ -544,10 +548,21 @@ where
         Ok(v)
     }
 
+    fn sync_bus(&mut self) -> Result<()> {
+        let cycles_since_last_sync = self.cycles - self.bus_sync_cycles;
+        if cycles_since_last_sync > 0 {
+            self.bus_sync_cycles += cycles_since_last_sync;
+            self.bus.tick(cycles_since_last_sync)?;
+        }
+        Ok(())
+    }
+
     /// Executes a single CPU step.
     pub fn step(&mut self) -> Result<()> {
         debug_assert_eq!(self.prefetch.len(), 2);
 
+        self.sync_bus()?;
+        
         self.step_ea_addr = None;
         self.step_exception = false;
         self.step_inhibit_trace = false;
@@ -742,10 +757,7 @@ where
 
     /// Advances by the given amount of cycles
     pub(in crate::cpu_m68k) fn advance_cycles(&mut self, ticks: Ticks) -> Result<()> {
-        for _ in 0..ticks {
-            self.cycles += 1;
-            self.bus.tick(1)?;
-        }
+        self.cycles += ticks;
         Ok(())
     }
 

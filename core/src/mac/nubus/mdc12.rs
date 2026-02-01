@@ -402,9 +402,10 @@ where
     fn tick(&mut self, ticks: Ticks) -> Result<Ticks> {
         self.vblank_ticks += ticks;
         if self.vblank_ticks > 16_000_000 / 60 {
-            self.render()?;
+            self.vblank_ticks -= 16_000_000 / 60;
 
-            self.vblank_ticks = 0;
+            self.render()?;
+            
             if self.vblank_enable {
                 self.vblank_irq = true;
             }
