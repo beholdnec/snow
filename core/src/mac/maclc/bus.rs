@@ -35,10 +35,6 @@ use bit_set::BitSet;
 use log::*;
 use serde::{Deserialize, Serialize};
 
-/// Wait states of a bus cycle on the Sonora, where every cycle runs on a
-/// 32-bit port
-const BUS_WAITS: Ticks = 1;
-
 /// Frequency of the bus of the LC and LC II, without overclocking: C16M,
 /// which the CPU runs at
 const V8_BUS_FREQUENCY: Ticks = 15_667_200;
@@ -46,12 +42,24 @@ const V8_BUS_FREQUENCY: Ticks = 15_667_200;
 /// Frequency of the bus of the LC III, without overclocking
 const SONORA_BUS_FREQUENCY: Ticks = 25_000_000;
 
-/// Wait states of a RAM or video RAM bus cycle on the V8
-const RAM_WAITS: Ticks = 1;
+/// Wait states of a RAM or video RAM bus cycle on the V8. This is the
+/// figure of the LC Developer Note, but the V8 services RAM accesses at set
+/// points of its own clock (LC III Developer Note), so the real number
+/// varies: to be measured on a real LC.
+const V8_RAM_WAITS: Ticks = 1;
 /// Wait states of a ROM bus cycle on the V8
-const ROM_WAITS: Ticks = 2;
-/// Wait states of an I/O bus cycle on the V8, not documented
+const V8_ROM_WAITS: Ticks = 2;
+/// Wait states of an I/O bus cycle, not documented
 const IO_WAITS: Ticks = 1;
+
+/// Wait states of a RAM read bus cycle on the Sonora
+const SONORA_RAM_READ_WAITS: Ticks = 2;
+/// Wait states of a RAM write bus cycle on the Sonora
+const SONORA_RAM_WRITE_WAITS: Ticks = 1;
+/// Wait states of a ROM bus cycle on the Sonora
+const SONORA_ROM_WAITS: Ticks = 2;
+/// Wait states of a video RAM bus cycle on the Sonora, not documented
+const SONORA_VRAM_WAITS: Ticks = 1;
 
 /// Bytes as a big endian number
 fn be_bytes(bytes: &[u8]) -> u32 {
@@ -433,16 +441,21 @@ where
         }
     }
 
-    /// Width in bytes and wait states of the port answering a region. The
-    /// RAM and video RAM data buses of the V8 are 16-bit, the ROM is 32-bit
-    /// and the rest of the devices 8-bit. The Sonora runs every cycle on a
-    /// 32-bit port.
-    fn port(&self, region: &Region) -> (u32, Ticks) {
+    /// Width in bytes and wait states of the port answering a region.
+    ///
+    /// The RAM and video RAM data buses of the V8 are 16-bit, the ROM is
+    /// 32-bit. The Sonora has a 32-bit RAM and ROM and a 16-bit video RAM.
+    /// The I/O devices are on D31-D24, as an 8-bit port, on both.
+    fn port(&self, region: &Region, write: bool) -> (u32, Ticks) {
         match (&self.gate_array, region) {
-            (GateArray::V8, Region::Ram(_) | Region::Vram(_)) => (2, RAM_WAITS),
-            (GateArray::V8, Region::Rom) => (4, ROM_WAITS),
-            (GateArray::V8, Region::Io(_) | Region::CpuId(_)) => (1, IO_WAITS),
-            (GateArray::Sonora { .. }, _) => (4, BUS_WAITS),
+            (_, Region::Io(_)) => (1, IO_WAITS),
+            (GateArray::V8, Region::Ram(_) | Region::Vram(_)) => (2, V8_RAM_WAITS),
+            (GateArray::V8, Region::Rom) => (4, V8_ROM_WAITS),
+            (GateArray::Sonora { .. }, Region::Ram(_)) if write => (4, SONORA_RAM_WRITE_WAITS),
+            (GateArray::Sonora { .. }, Region::Ram(_)) => (4, SONORA_RAM_READ_WAITS),
+            (GateArray::Sonora { .. }, Region::Rom) => (4, SONORA_ROM_WAITS),
+            (GateArray::Sonora { .. }, Region::Vram(_)) => (2, SONORA_VRAM_WAITS),
+            (_, Region::CpuId(_)) => (4, IO_WAITS),
         }
     }
 
@@ -683,18 +696,18 @@ where
         let resp = match self.decode(acc.addr) {
             // During the boot overlay, reads of the RAM area go to the ROM
             Some(Region::Ram(_)) if self.overlay && !acc.write => {
-                let port = self.port(&Region::Rom);
+                let port = self.port(&Region::Rom, false);
                 self.cycle(acc, port, Self::rom_read, Self::ignore_write)
             }
             Some(region @ Region::Ram(addr)) => self.cycle(
                 acc,
-                self.port(&region),
+                self.port(&region, acc.write),
                 move |s, _, len| s.ram_read(addr, len),
                 move |s, _, len, val| s.ram_write(addr, len, val),
             ),
             Some(region @ Region::Rom) => self.cycle(
                 acc,
-                self.port(&region),
+                self.port(&region, acc.write),
                 |s, addr, len| {
                     s.overlay = false;
                     s.rom_read(addr, len)
@@ -702,16 +715,18 @@ where
                 Self::ignore_write,
             ),
             Some(Region::Io(offset @ 0x0_0000..=0x0_1FFF)) => self.via_cycle(acc, offset),
-            Some(region @ Region::Io(offset)) => self.io_cycle(acc, self.port(&region), offset),
+            Some(region @ Region::Io(offset)) => {
+                self.io_cycle(acc, self.port(&region, acc.write), offset)
+            }
             Some(region @ Region::Vram(offset)) => self.cycle(
                 acc,
-                self.port(&region),
+                self.port(&region, acc.write),
                 move |s, _, len| s.vram_read(offset, len),
                 move |s, _, len, val| s.vram_write(offset, len, val),
             ),
             Some(region @ Region::CpuId(n)) => self.cycle(
                 acc,
-                self.port(&region),
+                self.port(&region, acc.write),
                 move |_, _, len| {
                     Some(be_bytes(
                         &sonora::CPU_ID_LCIII.to_be_bytes()[n..][..len as usize],
