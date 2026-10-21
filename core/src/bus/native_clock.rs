@@ -27,6 +27,51 @@ pub struct Step {
     pub cpu_used: Ticks,
 }
 
+/// Helper struct used to work with fractional tick values when scaling from
+/// an input frequency to an output frequency.
+///
+/// Rational arithmetic is used to avoid errors.
+#[derive(Copy, Clone, Serialize, Deserialize)]
+struct ClockScaler {
+    /// Represents the number of elapsed output ticks.
+    ///
+    /// The number of elapsed output ticks is `N / in_freq`. On each input tick,
+    /// the value increases by `out_freq`.
+    n: Ticks,
+    in_freq: Ticks,
+    out_freq: Ticks,
+}
+
+impl ClockScaler {
+    fn new(in_freq: Ticks, out_freq: Ticks) -> Self {
+        ClockScaler {
+            n: 0,
+            in_freq,
+            out_freq,
+        }
+    }
+
+    fn add_in_ticks(&mut self, in_ticks: Ticks) {
+        self.n += in_ticks * self.out_freq;
+    }
+
+    fn subtract_out_ticks(&mut self, out_ticks: Ticks) {
+        self.n -= out_ticks * self.in_freq;
+    }
+
+    fn out_ticks(&self) -> Ticks {
+        self.n / self.in_freq
+    }
+
+    /// Return the number of input ticks needed until a given number of output ticks
+    /// have elapsed
+    fn in_ticks_until_out_ticks(&self, out_ticks: Ticks) -> Ticks {
+        (out_ticks * self.in_freq)
+            .saturating_sub(self.n)
+            .div_ceil(self.out_freq)
+    }
+}
+
 /// Native clock of a machine's device bus, which the CPU may run faster
 /// than when overclocking.
 ///
@@ -42,9 +87,8 @@ pub struct NativeClock {
     cpu_freq: Ticks,
     /// Native ticks per VIA tick
     via_divider: Ticks,
-    /// How far the next native tick has got: each CPU tick adds
-    /// `native_freq`, and a native tick completes at `cpu_freq`
-    progress: Ticks,
+    /// The value `n` in the CPU-to-native clock downscaler
+    native_clockgen: ClockScaler,
     /// Native ticks since the last VIA tick
     via_phase: Ticks,
     /// Native ticks elapsed
@@ -59,7 +103,7 @@ impl NativeClock {
             native_freq,
             cpu_freq: native_freq,
             via_divider,
-            progress: 0,
+            native_clockgen: ClockScaler::new(native_freq, native_freq),
             via_phase: 0,
             native_ticks: 0,
         }
@@ -68,7 +112,7 @@ impl NativeClock {
     /// Sets the frequency of the CPU, which includes any overclocking
     pub fn set_cpu_frequency(&mut self, cpu_freq: Ticks) {
         self.cpu_freq = cpu_freq;
-        self.progress = 0;
+        self.native_clockgen = ClockScaler::new(cpu_freq, self.native_freq);
     }
 
     /// True when the CPU runs faster than the native clock
@@ -103,14 +147,15 @@ impl NativeClock {
             (native, native)
         } else {
             // CPU ticks for `limit` native ticks to complete
-            let needed = (limit * self.cpu_freq - self.progress).div_ceil(self.native_freq);
+            let needed = self.native_clockgen.in_ticks_until_out_ticks(limit);
             if needed <= cpu_ticks {
-                self.progress = self.progress + needed * self.native_freq - limit * self.cpu_freq;
+                self.native_clockgen.add_in_ticks(needed);
+                self.native_clockgen.subtract_out_ticks(limit);
                 (limit, needed)
             } else {
-                self.progress += cpu_ticks * self.native_freq;
-                let native = self.progress / self.cpu_freq;
-                self.progress -= native * self.cpu_freq;
+                self.native_clockgen.add_in_ticks(cpu_ticks);
+                let native = self.native_clockgen.out_ticks();
+                self.native_clockgen.subtract_out_ticks(native);
                 (native, cpu_ticks)
             }
         };
@@ -193,13 +238,18 @@ impl NativeClock {
     /// Where the CPU is, `cpu_ahead` CPU ticks after the clock was last
     /// advanced: the native ticks it has completed since, and how far it is
     /// into the next one
+    ///
+    /// TODO (beholdnec): I'd like to get rid of this method
     fn cpu_position(&self, cpu_ahead: Ticks) -> (Ticks, Ticks) {
-        let progress = self.progress + cpu_ahead * self.native_freq;
-        (progress / self.cpu_freq, progress % self.cpu_freq)
+        let mut progress = self.native_clockgen;
+        progress.add_in_ticks(cpu_ahead);
+        (progress.out_ticks(), progress.n % self.cpu_freq)
     }
 
     /// CPU ticks until `native_ticks` more native ticks have completed, from
     /// `into_tick` into the current one
+    ///
+    /// TODO (beholdnec): I'd like to get rid of this method
     fn cpu_ticks_until(&self, native_ticks: Ticks, into_tick: Ticks) -> Ticks {
         (native_ticks * self.cpu_freq - into_tick).div_ceil(self.native_freq)
     }
