@@ -124,6 +124,8 @@ pub struct MacLCBus<TRenderer: Renderer> {
 
     pub(crate) via: Via,
     egret: Egret,
+    /// Native time the SWIM can be accessed again
+    swim_ready: Ticks,
     tick60_clock: Ticks,
     pub(crate) scc: Scc,
     pub(crate) swim: Swim,
@@ -242,6 +244,7 @@ where
             ram_dirty: BitSet::from_iter(0..(ram_size / RAM_DIRTY_PAGESIZE)),
             via: Via::new(model),
             egret,
+            swim_ready: 0,
             tick60_clock: 0,
             scc: Scc::new(),
             swim,
@@ -577,6 +580,39 @@ where
         }
     }
 
+    /// The ISM needs some time between two accesses (Swim::ism_recovery), so
+    /// a SWIM cycle is held off until then, as the Mac II does for the SCC.
+    /// Whether the gate array holds the cycle off like this, or relies on
+    /// software to space its accesses, is not known: to be measured on a
+    /// real LC.
+    /// When overclocking, the accesses are also held as far apart as
+    /// Swim::hold() needs.
+    fn swim_cycle(&mut self, acc: BusAccess<Bus68020>, offset: Address) -> BusResponse {
+        let w = match self.native_clock.device_sync(&acc) {
+            DeviceCycle::Stall(n) => return BusResponse::Stall(n),
+            DeviceCycle::Access(w) => w,
+        };
+        // When overclocking, acc.pending is 0 after device_sync(), and native
+        // ticks are CPU ticks otherwise
+        let now = self.native_clock.native_ticks() + acc.pending;
+        let hold = self
+            .swim_ready
+            .saturating_sub(now)
+            .max(self.swim.hold(&self.native_clock));
+        // FCLK is C16M. The recovery counts from the end of the cycle, which
+        // takes 3 clocks.
+        let recovery = (self.swim.ism_recovery() * self.bus_frequency()).div_ceil(C16M_FREQUENCY);
+        self.swim_ready = now + hold + 3 + IO_WAITS + recovery;
+        let w = self.native_clock.scale_dev_waits(w, IO_WAITS + hold);
+        bus_access_byte(
+            acc,
+            w,
+            self,
+            move |s, _, len| s.io_read_bytes(offset, len),
+            move |s, _, len, val| s.io_write_bytes(offset, len, val),
+        )
+    }
+
     /// Updates the mouse position (relative coordinates) and button state
     pub fn mouse_update_rel(&mut self, relx: i16, rely: i16, button: Option<bool>) {
         if self.mouse_mode == MouseMode::Disabled {
@@ -715,6 +751,7 @@ where
                 Self::ignore_write,
             ),
             Some(Region::Io(offset @ 0x0_0000..=0x0_1FFF)) => self.via_cycle(acc, offset),
+            Some(Region::Io(offset @ 0x1_6000..=0x1_7FFF)) => self.swim_cycle(acc, offset),
             Some(region @ Region::Io(offset)) => {
                 self.io_cycle(acc, self.port(&region, acc.write), offset)
             }
