@@ -5,7 +5,9 @@ use super::pseudovia::PseudoVia;
 use super::via::Via;
 use super::video::{self, Video};
 use super::{sonora, v8};
-use crate::bus::access::{Bus68020, BusAccess, BusResponse, bus_access_byte, bus_access_long};
+use crate::bus::access::{
+    Bus68020, BusAccess, BusResponse, bus_access_byte, bus_access_long, bus_access_word,
+};
 use crate::bus::native_clock::{DeviceCycle, NativeClock};
 use crate::bus::{Address, Bus, BusMember, InspectableBus, IrqSource};
 use crate::debuggable::Debuggable;
@@ -33,7 +35,8 @@ use bit_set::BitSet;
 use log::*;
 use serde::{Deserialize, Serialize};
 
-/// Wait states of a bus cycle
+/// Wait states of a bus cycle on the Sonora, where every cycle runs on a
+/// 32-bit port
 const BUS_WAITS: Ticks = 1;
 
 /// Frequency of the bus of the LC and LC II, without overclocking: C16M,
@@ -42,6 +45,23 @@ const V8_BUS_FREQUENCY: Ticks = 15_667_200;
 
 /// Frequency of the bus of the LC III, without overclocking
 const SONORA_BUS_FREQUENCY: Ticks = 25_000_000;
+
+/// Wait states of a RAM or video RAM bus cycle on the V8
+const RAM_WAITS: Ticks = 1;
+/// Wait states of a ROM bus cycle on the V8
+const ROM_WAITS: Ticks = 2;
+/// Wait states of an I/O bus cycle on the V8, not documented
+const IO_WAITS: Ticks = 1;
+
+/// Port answering a bus cycle on the V8
+enum Port {
+    /// RAM and video RAM, 16-bit
+    Ram,
+    /// ROM, 32-bit
+    Rom,
+    /// I/O chips and the V8, 8-bit
+    Io,
+}
 
 /// Frequency of the main clock (C16M)
 pub(super) const C16M_FREQUENCY: Ticks = 15_667_200;
@@ -413,6 +433,19 @@ where
         }
     }
 
+    /// The RAM and video RAM data buses of the V8 are 16-bit, the ROM is
+    /// 32-bit and the rest of the devices 8-bit. During the boot overlay,
+    /// reads of the RAM area go to the ROM and writes to the RAM.
+    fn v8_port(&self, addr: Address, write: bool) -> Port {
+        match self.decode(addr) {
+            Some(Region::Ram(_)) if self.overlay && !write => Port::Rom,
+            Some(Region::Ram(_) | Region::Vram(_)) => Port::Ram,
+            Some(Region::Rom) => Port::Rom,
+            // The byte decode logs the bus error of an unmapped address
+            Some(Region::Io(_) | Region::CpuId(_)) | None => Port::Io,
+        }
+    }
+
     fn read_byte(&mut self, addr: Address) -> Option<Byte> {
         let val = match self.decode(addr) {
             // ROM (overlay)
@@ -596,13 +629,22 @@ where
         if let Some(Region::Io(0x0_0000..=0x0_1FFF)) = self.decode(acc.addr) {
             return Ok(self.via_cycle(acc));
         }
-        Ok(bus_access_long(
-            acc,
-            BUS_WAITS,
-            self,
-            Self::read_bytes,
-            Self::write_bytes,
-        ))
+        let (read, write) = (Self::read_bytes, Self::write_bytes);
+        Ok(match self.gate_array {
+            GateArray::V8 => match self.v8_port(acc.addr, acc.write) {
+                Port::Ram => bus_access_word(acc, RAM_WAITS, self, read, write),
+                Port::Rom => bus_access_long(acc, ROM_WAITS, self, read, write),
+                // I/O cycles take native time
+                Port::Io => match self.native_clock.device_sync(&acc) {
+                    DeviceCycle::Stall(n) => BusResponse::Stall(n),
+                    DeviceCycle::Access(w) => {
+                        let w = self.native_clock.scale_dev_waits(w, IO_WAITS);
+                        bus_access_byte(acc, w, self, read, write)
+                    }
+                },
+            },
+            GateArray::Sonora { .. } => bus_access_long(acc, BUS_WAITS, self, read, write),
+        })
     }
 
     fn get_mask(&self) -> Address {
